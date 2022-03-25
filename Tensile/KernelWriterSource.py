@@ -842,8 +842,6 @@ class KernelWriterSource(KernelWriter):
     ptrStr = kernel["ProblemType"]["DestDataType"].toDevice(self.language)
     if kernel["_GlobalAccumulation"]:
       ptrStr = kernel["ProblemType"]["ComputeDataType"].toDevice(self.language)
-      if kernel["ProblemType"]["DataType"].isHalf() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
-        ptrStr = DataType('single').toDevice(self.language)
 
     isStridedBuffer = kernel["ProblemType"]["StridedBatched"] or kernel["_GlobalAccumulation"]
     ptrStr  += ("" if isStridedBuffer else "*")
@@ -1748,6 +1746,13 @@ class KernelWriterSource(KernelWriter):
         % ( tP["tensorChar"], tP["tileChar"], tP["tileChar"], \
         " + LDS_OFFSET_B" if tP["isB"] else "", self.endLine)
     return kStr
+
+  ##############################################################################
+  # Local Read Addresses offset conversion for DTL + NLC > 1
+  ##############################################################################
+  def lraOffsetConversionForDTLandNLC(self, kernel, tP, offset_val, generateAsm=False, \
+                                      finalVgpr=None, tmp1=None, tmp2=None):
+    return ""
 
   ##############################################################################
   # Local Read Addresses: Declare Addresses A/B
