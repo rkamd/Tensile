@@ -2449,13 +2449,6 @@ class Solution(collections.abc.Mapping):
         reject(state, "can't use DirectToLds for not EnableMatrixInstruction and GlobalLoadVectorWidth%c * bpe * WavefrontSize > 256"%tc)
         return False
 
-    # TODO revisit fp32 case for failure
-    #if state["ProblemType"]["TLU%c"%tc] and numBytes < 8 and state["GlobalLoadVectorWidth%c"%tc] * numBytes > 4:
-    if numBytes < 8 and state["GlobalLoadVectorWidth%c"%tc] * numBytes > 4:
-      reject(state, "can't use DirectToLds for TLU%c and bpe < 8 and GlobalLoadVectorWidth%c * bpe > 4"%(tc, tc))
-      return False
-
-
     if state["WaveSeparateGlobalRead%c" % tc]:
       if state["LSC%c"%tc] * state["LSP%c"%tc] * numBytes != state["WavefrontSize"] * state["GlobalLoadVectorWidth%c"%tc] * numBytes:
         reject(state, "can't use DirectToLds for LSC%c and LSP%c * bpe!= WavefrontSize * GlobalLoadVectorWidth%c * bpe > 4"%(tc, tc, tc))
@@ -2491,11 +2484,15 @@ class Solution(collections.abc.Mapping):
       reject(state, "can't use DirectToLds for LocalReadVectorWidth == 2")
       return False
 
-    # Does not work with (NumLoadsCoalesced>1 and UseInstOffsetForGRO) + DGEMM
-    if state["ProblemType"]["DataType"].isDouble() and \
-      (state["NumLoadsCoalesced%c"%tc] > 1 and state["UseInstOffsetForGRO"]):
-      reject(state, "DirectToLds%c does not supports NumLoadsCoalesced%c > 1 and UseInstOffsetForGRO for dgemm"%(tc, tc))
-      return False
+    if state["NumLoadsCoalesced%c"%tc] > 1:
+      # NumLoadsCoalesced > 1 not working for sgemm
+      if numBytes < 8:
+        reject(state, "Can't use NumLoadsCoalesced > 1 with DirectToLds for this data type")
+        return False
+      # Does not work with (NumLoadsCoalesced>1 and UseInstOffsetForGRO) + DGEMM
+      if state["ProblemType"]["DataType"].isDouble() and state["UseInstOffsetForGRO"]:
+        reject(state, "DirectToLds%c does not supports NumLoadsCoalesced%c > 1 and UseInstOffsetForGRO for dgemm"%(tc, tc))
+        return False
 
     # Does not work with NumLoadsCoalesced>1 + ZGEMM
     if state["ProblemType"]["DataType"].isDoubleComplex() and state["NumLoadsCoalesced%c"%tc] > 1:
@@ -2531,6 +2528,20 @@ class Solution(collections.abc.Mapping):
 
     return True
 
+  @staticmethod
+  def getDivisorName(state, tC):
+    if state["GlobalReadCoalesceGroup{}".format(tC)]:
+      if state["GlobalReadCoalesceVector{}".format(tC)]:
+        divisorName = "LVC{}".format(tC)
+      else:
+        # Fractional load use the more accurate lsc, multiply by VW later
+        divisorName = "LSC{}".format(tC)
+    else:
+      if state["GlobalReadCoalesceVector{}".format(tC)]:
+        divisorName = "LSP{}".format(tC)
+      else:
+        divisorName = "LVP{}".format(tC)
+    return divisorName
 
   ########################################
   # assign all derived parameters
@@ -2589,13 +2600,7 @@ class Solution(collections.abc.Mapping):
       state["1LDSBuffer"] = 1
       print2("\nSet SIA=2, force PrefetchLocalRead=1, ExpandPointerSwap=1, 1LDSBuffer=1")
 
-    # F32 only for now but we should extend this for other data types as well.
     isa = tuple(state["ISA"])
-    if "MACInstruction" not in state or state["MACInstruction"] not in validParameters["MACInstruction"]:
-      if globalParameters["AsmCaps"][isa]["v_mac_f32"]:
-        state["MACInstruction"] = "MAC"
-      else:
-        state["MACInstruction"] = "FMA"
 
     if state["WavefrontSize"] == 32 and not globalParameters["ArchCaps"][isa]["HasWave32"]:
       reject(state, "WavefrontSize=32 not supported for ISA {}".format(isa))
@@ -3261,6 +3266,18 @@ class Solution(collections.abc.Mapping):
     state["LVPA"] = roundupRatio(state["LSPA"] , state["GlobalLoadVectorWidthA"])
     state["LVCB"] = roundupRatio(state["LSCB"] , state["GlobalLoadVectorWidthB"])
     state["LVPB"] = roundupRatio(state["LSPB"] , state["GlobalLoadVectorWidthB"])
+
+    if state["SplitGlobalRead"] > 1:
+      if state["DirectToLds"]:
+        reject(state, "SplitGlobalRead not yet supported with DirectToLds")
+      if state["DirectToVgprA"] or state["DirectToVgprB"]:
+        reject(state, "SplitGlobalRead does not work with DirectToVgpr")
+      divisorNameA = Solution.getDivisorName(state, "A")
+      divisorNameB = Solution.getDivisorName(state, "B")
+      divisorA = state[divisorNameA]
+      divisorB = state[divisorNameB]
+      if state["SplitGlobalRead"] >= divisorA and state["SplitGlobalRead"] >= divisorB:
+        reject(state, "SplitGlobalRead must be less than lvc/lsc/lvp/lsp")
 
     for tc in ('A','B'):
       if problemType["TLU%s"%tc]:
