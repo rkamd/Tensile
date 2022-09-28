@@ -1,5 +1,6 @@
 TestParameters:
-  marks: [skip-gfx900, skip-gfx906, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102] # not supported by arch
+  marks: [xfail, skip-gfx900, skip-gfx906, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102] # not supported by arch
+  # Failing on latest ROCm build, re-enable when passing
 
 GlobalParameters:
   NumElementsToValidate: -1
@@ -49,7 +50,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -111,7 +112,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -173,7 +174,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] #[1,2]
+        - PrefetchGlobalRead: [1,2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -229,7 +230,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -303,7 +304,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -366,7 +367,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -429,7 +430,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] #[1,2]
+        - PrefetchGlobalRead: [1,2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -486,7 +487,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -561,7 +562,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -624,7 +625,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -687,7 +688,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] #[1,2]
+        - PrefetchGlobalRead: [1,2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
@@ -744,7 +745,7 @@ BenchmarkProblems:
         - WorkGroup:
           - [ 16, 16, 1 ]
         - SourceSwap: [True]
-        - PrefetchGlobalRead: [1] # [1, 2]
+        - PrefetchGlobalRead: [1, 2]
         #- AssertFree0ElementMultiple: [2]
         # - AssertFree1ElementMultiple: [2]
         - WorkGroupMapping: [8]
