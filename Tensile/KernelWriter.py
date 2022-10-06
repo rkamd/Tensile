@@ -547,18 +547,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
         # since LocalWrite/GlobalRead pair depends on GlobalReadInc, we count in only GlobalReadInc
         if kernel["PrefetchGlobalRead"] == 2:
           loadsToSched = len(itemsGRIncToSched)
-          dec = 1
         else:
           loadsToSched = len(itemsGRToSched)
-          # subtract the portion of empty modules added after the last load
-          endLastEmpty = loadsToSched/self.numGlobalReadInsPerMfma
-          endLastLoad = loadsToSched - (PRECISION - 1)
-          dec = max(1, roundUp((endLastEmpty - endLastLoad)/self.numGlobalReadInsPerMfma))
 
         # Here is to adjust scheduling silently in order to have validation pass.
         # Better way is to use larger globalReadPerMfma.
         ## schedule more instructions at first iteration if no enough mfma to schedule globalRead
-        self.grEndMfmaIndex = max(0, roundUp(loadsToSched/self.numGlobalReadInsPerMfma) - dec)
+        self.grEndMfmaIndex = max(0, roundUp(loadsToSched/self.numGlobalReadInsPerMfma) - 1)
         if self.grEndMfmaIndex > self.lwEndMfmaIndex:
           schedNumForIter0 = numGlobalReadInsPerIter + (self.grEndMfmaIndex - self.lwEndMfmaIndex) * self.numGlobalReadInsPerMfma
           self.grEndMfmaIndex = self.lwEndMfmaIndex
@@ -1998,6 +1993,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
                   retStr = self.getWaitcntCodeForDirectToVgpr(kernel, localWriteEndIter, u, firstIter=False, beforeBarrier=True)
                   waitLWCode.addCode(retStr)
             if self.enable["Sync"]:
+              if kernel["PrefetchGlobalRead"]==2 and (kernel["DirectToLdsA"] and kernel["DirectToLdsB"]):
+                # PGR=2 and DTLA+B case, wait for global read needs to be added (wait is not generated with local write)
+                syncCode.addCode(self.wait(kernel, tensorParametersA, tensorParametersB, 0, -1, -1, "wait for global read with lds"))
               syncCode.addCode(self.syncThreads(kernel))
 
           if isSwapAndResetLwoIter: # ResetLroIter
@@ -2525,8 +2523,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
         if u == localWriteEndIter+1 or (u == (localWriteEndIter+1)%kernel["LoopIters"] and kernel["ScheduleIterAlg"] == 2):
           if self.enable["Wait"]:
             if kernel["DirectToLdsA"] or kernel["DirectToLdsB"]:
-              # skip generating wait for global read again here in DirectToVgpr case
-              if not(kernel["DirectToVgprA"] or kernel["DirectToVgprB"]):
+              # skip generating wait for global read again here in DirectToVgpr case or no DirectToVgpr + PGR=2
+              # no DTV and PGR=2 case, wait is generated at sync (barrier), which is before next local read
+              if not(kernel["DirectToVgprA"] or kernel["DirectToVgprB"]) and not kernel["PrefetchGlobalRead"]==2:
                 kl.append(self.wait(kernel, tensorParametersA, tensorParametersB, 0, -1, -1, "12wait for global read"))
               else:
                 # DirectToVgpr + DirectToLds case, add waitcnt vmcnt before s_barrier
@@ -3194,8 +3193,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
           mEnd = 1
           if kernel["DirectToVgprA"] or kernel["DirectToVgprB"]:
             mEnd = kernel["DepthU"]//KinInnerUnroll
+          # need to cover different local read inc values for the following DirectToLds case
           elif kernel["DirectToLds"] and kernel["EnableMatrixInstruction"] and kernel["InnerUnroll"] == 1 and\
-               (kernel["GlobalLoadVectorWidthA"] * self.bpeAB > 4 or kernel["GlobalLoadVectorWidthB"] * self.bpeAB > 4) and \
+               (kernel["GlobalLoadVectorWidthA"] * self.bpeAB > 4 or kernel["GlobalLoadVectorWidthB"] * self.bpeAB > 4
+                or kernel["ThreadSeparateGlobalReadA"] or kernel["ThreadSeparateGlobalReadB"]) and \
                kernel["DepthU"] // kernel["MatrixInstK"] > 2:
             mEnd = kernel["DepthU"] // (kernel["MatrixInstK"] * 2)
 
@@ -4229,6 +4230,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return ""
 
   ##############################################################################
+  # Local Read Addresses for direct LDS : Final Offset A/B
+  ##############################################################################
+  @abc.abstractmethod
+  def directToLdsLraOffset(self, kernel, finalVgpr, tmp1, tmp2, tP):
+    return ""
+
+  ##############################################################################
   # Local Read Addresses offset conversion for DTL + NLC > 1
   ##############################################################################
   @abc.abstractmethod
@@ -4970,7 +4978,13 @@ for codeObjectFileName in codeObjectFileNames:
     if globalParameters["PrintCodeCommands"]:
       print (' '.join(args), " && ")
 
-    subprocess.check_call(args, cwd=self.getAssemblyDirectory())
+    # change to use  check_output to force windows cmd block util command finish
+    try:
+      out = subprocess.check_output(args, stderr=subprocess.STDOUT, cwd=self.getAssemblyDirectory())
+      print2(out)
+    except subprocess.CalledProcessError as err:
+      print(err.output)
+      raise
 
     return objectFileName
 
@@ -4984,7 +4998,13 @@ for codeObjectFileName in codeObjectFileNames:
     if globalParameters["PrintCodeCommands"]:
       print (' '.join(args))
 
-    subprocess.check_call(args, cwd=self.getAssemblyDirectory())
+    # change to use  check_output to force windows cmd block util command finish
+    try:
+      out = subprocess.check_output(args, stderr=subprocess.STDOUT, cwd=self.getAssemblyDirectory())
+      print2(out)
+    except subprocess.CalledProcessError as err:
+      print(err.output)
+      raise
 
     return coFileName
 
@@ -5315,8 +5335,8 @@ for codeObjectFileName in codeObjectFileNames:
       kStrBeta = ""
       for x in self.BetaOpTemplate.items():
         kStrBeta += str(x)
-      # double complex case, put beta instruction separately
-      if kStrBeta != "" and kernel["ProblemType"]["DestDataType"].isDoubleComplex():
+      # double complex case or num of store == 1 case, put beta instruction separately
+      if kStrBeta != "" and (kernel["ProblemType"]["DestDataType"].isDoubleComplex() or self.getNumberOfStoreCInTemplate(kernel) == 1):
         # combine beta code with first StoreC comment to avoid generating beta before alpha
         self.StoreCUnrollCode.addText(kStrBeta + StartComment)
         kStrBeta = ""
