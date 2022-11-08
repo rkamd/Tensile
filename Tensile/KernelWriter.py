@@ -451,7 +451,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
                          list(self.globalReadBCode.middle.items())
         itemsGRToSchedLaterDTV = []
         # PGR2 and DirectToVgpr case, schedule global read for DirectToVgpr separately after registers are used for mfma
-        if kernel["EnableMatrixInstruction"] and kernel["ScheduleIterAlg"] == 3:
+        if kernel["EnableMatrixInstruction"]:
           if kernel["DirectToVgprA"] or kernel["DirectToVgprB"]:
             itemsGRToSchedLater = list(self.globalReadACode.middle.items())      # not DirectToVgpr (A has non-DirectToVgpr load)
             itemsGRToSchedLaterDTV = list(self.globalReadBCode.middle.items()) # DirectToVgpr (B has DirectToVgpr load)
@@ -866,6 +866,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.scheduleIterAlg==0:
       # simple schedule, just add the modules in-order
       iterCode.addCode(globalReadCode)
+      iterCode.addCode(globalReadCodeDTV)
+      # pop out all items
+      while len(list(globalReadCodeDTV.items())):
+        globalReadCodeDTV.items().pop(0)
       iterCode.addCode(waitLWCode)
       iterCode.addCode(syncCode)
       iterCode.addCode(localReadCode)
@@ -896,6 +900,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
             break
 
       iterCode.addCode(globalReadCode)
+      iterCode.addCode(globalReadCodeDTV)
+      # pop out all items
+      while len(list(globalReadCodeDTV.items())):
+        globalReadCodeDTV.items().pop(0)
 
       # add rest of the reads here
       for item in readItems:
@@ -914,6 +922,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # 2 workgroup interleave, while WG0/WG1 doing compute, WG1/WG0 doing fetch
     # EPS need to be 1, or valu instruction will break interleave
       iterCode.addCode(globalReadCode)
+      iterCode.addCode(globalReadCodeDTV)
+      # pop out all items
+      while len(list(globalReadCodeDTV.items())):
+        globalReadCodeDTV.items().pop(0)
       iterCode.addCode(waitLWCode)
       iterCode.addCode(syncCode)
       iterCode.addCode(localReadCode)
@@ -1141,6 +1153,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       for i in range(numMfmaPerIter):
         mfmaIndex = iteration * numMfmaPerIter + i
+        lastMfmaIndex = kernel["LoopIters"] * numMfmaPerIter - 1
         iterCode.addComment0(" mfmaIndex:%u " %(mfmaIndex))
 
         ####
@@ -1438,6 +1451,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
           insertMfmaIndex = kernel["LoopIters"] * numMfmaPerIter - 1 - interval * (remainingTimesToInsert - 1)
           # avoid insertMfmaIndex getting smaller than (kernel["LoopIters"] - 1) * numMfmaPerIter
           insertMfmaIndex = max(insertMfmaIndex, (kernel["LoopIters"] - 1) * numMfmaPerIter)
+          # avoid insertMfmaIndex getting smaller than lwEndMfmaIndex (DTV loads must be generated after non DTV loads)
+          insertMfmaIndex = max(insertMfmaIndex, self.lwEndMfmaIndex)
+          # if mfmaIndex is the last index, insert all DTV loads
+          if mfmaIndex == lastMfmaIndex:
+            insertMfmaIndex = mfmaIndex
+            numInstToInsert = numLoadVgpr
           if mfmaIndex == insertMfmaIndex:
             for i in range(min(numLoadVgpr, numInstToInsert)):
               loadDTVText = str(globalReadCodeDTV.items().pop(0))
@@ -1524,7 +1543,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
         iterCode.addComment0("dataAtIterA=%u numReadsIterA=%u skipReadsIterA=%u readsPerIterA=%u" % (dataAtIterA, numReadsIterA, skipReadsIterA, self.numReadsPerIterA))
         iterCode.addComment0("dataAtIterB=%u numReadsIterB=%u skipReadsIterB=%u readsPerIterB=%u" % (dataAtIterB, numReadsIterB, skipReadsIterB, self.numReadsPerIterB))
         if kernel["ScheduleIterAlg"] == 0 or kernel["ScheduleIterAlg"] == 1:
-          for i in range (max(dataAtIterA,dataAtIterB),iteration+1):
+          # adjust the initial value of loop counter for DirectToVgpr
+          adj = 1 if (kernel["DirectToVgprA"] or kernel["DirectToVgprB"]) else 0
+          for i in range (max(dataAtIterA,dataAtIterB)+adj,iteration+1):
             localWrites += self.perIterLocalWriteCode[i].countType(Code.LocalWriteInst)
         # ScheduleIterAlg=2, localwrite is after waitCnt, no need to count it's current iteration.
         if kernel["ScheduleIterAlg"] == 3:
@@ -1850,11 +1871,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   # get conditions to skip local write wait
   ##############################################################################
-  def getConditionToSkipLocalWriteWait( self, kernel , isPap, u):
-    # not generate wait code here if u == 0 and DirectToVgpr + DirectToLds is enabled
+  def getConditionToSkipLocalWriteWait( self, kernel , isPap, u, lastU):
+    # not generate wait code here if u == 0 u != lastU and DirectToVgpr + DirectToLds is enabled
     # (to remove redundant wait. isPap case only)
     # exception is PGR=2. wait is necessary for u = 0 in PGR=2 case
-    cond1 = not (isPap and u == 0 and kernel["PrefetchLocalRead"] != 0 and \
+    cond1 = not (isPap and u == 0 and u != lastU and kernel["PrefetchLocalRead"] != 0 and \
        (kernel["DirectToVgprA"] and kernel["DirectToLdsB"] or kernel["DirectToVgprB"] and kernel["DirectToLdsA"])) \
       or kernel["PrefetchGlobalRead"]==2
     # no need local read wait if LocalReadVectorWidth==2 and u is odd.
@@ -2027,7 +2048,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # we initiate lgkmcnt to 0, then assigning it correct value in makeSubIterSchedule()
       if self.enable["Wait"]:
-        if self.getConditionToSkipLocalWriteWait(kernel, isPap, u):
+        if self.getConditionToSkipLocalWriteWait(kernel, isPap, u, kernel["LoopIters"] - 1):
           waitCode = self.wait(kernel, tensorParametersA, tensorParametersB, \
               -1, 0, 0, \
               "wait for prior local read local write")
@@ -2512,7 +2533,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
             #  2) local write code in previous u (u-1) has waitcnt vmcnt
             prevVmcnt = False
             prevLocalWrite = ""
-            if (u > 0):
+            if (u > 0 and kernel["ScheduleIterAlg"] == 3):
               for up in range(u):
                 prevLocalWrite += ' '.join([str(x) for x in self.perIterLocalWriteCode[up].flatitems()])
               prevVmcnt = "vmcnt" in prevLocalWrite
@@ -2573,7 +2594,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # we initiate lgkmcnt to 0, then assigning it correct value in makeSubIterSchedule()
       if self.enable["Wait"]:
-        if self.getConditionToSkipLocalWriteWait(kernel, True, u):
+        if self.getConditionToSkipLocalWriteWait(kernel, True, u, kernel["LoopIters"] - 1):
           waitCode = self.wait(kernel, tensorParametersA, tensorParametersB, \
               -1, 0, 0, \
               "wait for prior local read local write")
@@ -2767,7 +2788,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       kl.append(self.comment3("Unrolled Loop - End"))
 
     oddLabel = lc == 0
-    kl.append(self.closeLoop(kernel, self.unrollIdx, finalLoop, oddLabel=oddLabel))
+    kl.append(self.closeLoop(kernel, self.unrollIdx, finalLoop, loopCopies, oddLabel=oddLabel))
 
   ##############################################################################
   # Kernel Body
@@ -3246,9 +3267,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 kl.append(self.macIter(kernel, 0, tailLoopInnerUnroll, True, True))
 
             finalLoop = mValue == mEnd - 1
-            kl.append(self.closeLoop(kernel, -1, finalLoop, uDu if kernel.enabledSplitLDS else None))
+            kl.append(self.closeLoop(kernel, -1, finalLoop, loopCopies, uDu if kernel.enabledSplitLDS else None))
       # always emit the skip-tail-loop label
-      kl.append(self.closeLoop(kernel, -1, None, emitEndLabelOnly=True))
+      kl.append(self.closeLoop(kernel, -1, None, loopCopies, emitEndLabelOnly=True))
       # tail: close
       self.inTailLoop = False
 
@@ -3256,7 +3277,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     for i in reversed(range(self.otherSummationLoops)):
       kl.append(self.comment("global read inc AB"))
       kl.append(self.globalReadIncrementAB(kernel, i, 0))
-      kl.append(self.closeLoop(kernel, i, True))
+      kl.append(self.closeLoop(kernel, i, True, loopCopies))
 
     if self.prefetchAcrossPersistent and kernel["PrefetchAcrossPersistentMode"] != 1:
       kl.append(str(self.openPrefetchAcrossPersistent(kernel, isOptNLL=False)))
@@ -4337,7 +4358,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   # Close Loop
   ##############################################################################
   @abc.abstractmethod
-  def closeLoop(self, kernel, loopIdx, finalLoop, uDu, emitEndLabelOnly, oddLabel=False):
+  def closeLoop(self, kernel, loopIdx, finalLoop, loopCopies, uDu, emitEndLabelOnly, oddLabel=False):
     return ""
 
   ##############################################################################
@@ -5169,8 +5190,8 @@ for codeObjectFileName in codeObjectFileNames:
             # beforeBarrier case, reduce the amount of non-Vgpr global read
             needToWait -= (numGlobalReadAll - numGlobalRead)
         # adjustment for oddLast
-        # oddLast case, ignore all of above and set 0
-        if oddLast:
+        # oddLast case or ScheduleIterAlg < 3 case, ignore all of above and set 0
+        if oddLast or kernel["ScheduleIterAlg"] < 3:
           needToWait = 0
         if kernel["StoreCInUnroll"]:
           # In StoreCInUnroll case,
