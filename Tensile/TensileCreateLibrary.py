@@ -218,6 +218,12 @@ def buildSourceCodeObjectFile(CxxCompiler, outputPath, kernelFile):
 
       hipFlags += ['-I', outputPath]
 
+      # Add build-id for builds with rocm 5.3+
+      compilerVer = globalParameters['HipClangVersion'].split(".")[:2]
+      compilerVer = [int(c) for c in compilerVer]
+      if len(compilerVer) >= 2 and (compilerVer[0] > 5 or (compilerVer[0] == 5 and compilerVer[1] > 2)):
+        hipFlags += ["-Xoffload-linker", "--build-id"]
+
       launcher = shlex.split(os.environ.get('Tensile_CXX_COMPILER_LAUNCHER', ''))
 
       if os.name == "nt":
