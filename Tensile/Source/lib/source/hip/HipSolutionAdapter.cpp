@@ -278,13 +278,14 @@ namespace Tensile
 
         hipError_t SolutionAdapter::launchKernel(KernelInvocation const& kernel)
         {
-            return launchKernel(kernel, nullptr, nullptr, nullptr);
+            return launchKernel(kernel, nullptr, nullptr, nullptr, nullptr);
         }
 
         hipError_t SolutionAdapter::launchKernel(KernelInvocation const& kernel,
                                                  hipStream_t             stream,
                                                  hipEvent_t              startEvent,
-                                                 hipEvent_t              stopEvent)
+                                                 hipEvent_t              stopEvent,
+                                                 KernelGraphInvocation* kernel_graph_invocation)
         {
             if(!kernel.codeObjectFile.empty())
             {
@@ -335,7 +336,21 @@ namespace Tensile
 
             void*  kernelArgs = const_cast<void*>(kernel.args.data());
             size_t argsSize   = kernel.args.size();
+            std::cout <<" RK: before CB : kernel.args ----> \n";
+                std::cout<< kernel.args ; 
+                std::cout << "---------------"<<std::endl;
+            
 
+            if(kernel_graph_invocation)
+            {
+                kernel_graph_invocation->kArgs = new KernelArguments(kernel.args);
+                kernelArgs = const_cast<void*>(kernel_graph_invocation->kArgs->data());
+                std::cout <<" RK: before CB : kargs ----> \n";
+                std::cout<< kernel_graph_invocation->kArgs ; 
+                std::cout << "---------------"<<std::endl;
+                hipHostFn_t updateKernelArgsFunc = updateKernelArgsFuncCB;
+                HIP_CHECK_RETURN(hipLaunchHostFunc(stream, updateKernelArgsFuncCB, (void*)kernel_graph_invocation));
+            }
             void* hipLaunchParams[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                                        kernelArgs,
                                        HIP_LAUNCH_PARAM_BUFFER_SIZE,
@@ -358,6 +373,14 @@ namespace Tensile
                                                       nullptr, // event
                                                       nullptr // event
                                                       ));
+
+            if(kernel_graph_invocation)
+            {
+                std::cout << "RK: CB ... " << std::endl;
+                hipHostFn_t deleteKernelArgsObjFunc = deleteKernelArgsObjFuncCB;
+                HIP_CHECK_RETURN(hipLaunchHostFunc(stream, deleteKernelArgsObjFuncCB, (void*)kernel_graph_invocation));
+            }
+
             if(stopEvent != nullptr)
                 HIP_CHECK_RETURN(hipEventRecord(stopEvent, stream));
             return hipSuccess;
@@ -375,7 +398,8 @@ namespace Tensile
         hipError_t SolutionAdapter::launchKernels(std::vector<KernelInvocation> const& kernels,
                                                   hipStream_t                          stream,
                                                   hipEvent_t                           startEvent,
-                                                  hipEvent_t                           stopEvent)
+                                                  hipEvent_t                           stopEvent,
+                                                  KernelGraphInvocation* kernel_graph_invocation)
         {
             auto first = kernels.begin();
             auto last  = kernels.end() - 1;
@@ -390,7 +414,7 @@ namespace Tensile
                 if(iter == last)
                     kStop = stopEvent;
 
-                HIP_CHECK_RETURN(launchKernel(*iter, stream, kStart, kStop));
+                HIP_CHECK_RETURN(launchKernel(*iter, stream, kStart, kStop,kernel_graph_invocation));
             }
             return hipSuccess;
         }
@@ -398,7 +422,8 @@ namespace Tensile
         hipError_t SolutionAdapter::launchKernels(std::vector<KernelInvocation> const& kernels,
                                                   hipStream_t                          stream,
                                                   std::vector<hipEvent_t> const&       startEvents,
-                                                  std::vector<hipEvent_t> const&       stopEvents)
+                                                  std::vector<hipEvent_t> const&       stopEvents,
+                                                  KernelGraphInvocation* kernel_graph_invocation)
         {
             if(kernels.size() != startEvents.size() || kernels.size() != stopEvents.size())
                 throw std::runtime_error(concatenate("Must have an equal number of kernels (",
@@ -411,7 +436,7 @@ namespace Tensile
 
             for(size_t i = 0; i < kernels.size(); i++)
             {
-                HIP_CHECK_RETURN(launchKernel(kernels[i], stream, startEvents[i], stopEvents[i]));
+                HIP_CHECK_RETURN(launchKernel(kernels[i], stream, startEvents[i], stopEvents[i],kernel_graph_invocation));
             }
             return hipSuccess;
         }

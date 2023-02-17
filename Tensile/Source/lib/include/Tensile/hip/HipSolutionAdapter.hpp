@@ -65,19 +65,23 @@ namespace Tensile
             hipError_t launchKernel(KernelInvocation const& kernel,
                                     hipStream_t             stream,
                                     hipEvent_t              startEvent,
-                                    hipEvent_t              stopEvent);
-
+                                    hipEvent_t              stopEvent,
+                                    KernelGraphInvocation* kernel_graph_invocation = nullptr);
+            
             hipError_t launchKernels(std::vector<KernelInvocation> const& kernels);
 
             hipError_t launchKernels(std::vector<KernelInvocation> const& kernels,
                                      hipStream_t                          stream,
                                      hipEvent_t                           startEvent,
-                                     hipEvent_t                           stopEvent);
+                                     hipEvent_t                           stopEvent,
+                                     KernelGraphInvocation* kernel_graph_invocation = nullptr);
 
             hipError_t launchKernels(std::vector<KernelInvocation> const& kernels,
                                      hipStream_t                          stream,
                                      std::vector<hipEvent_t> const&       startEvents,
-                                     std::vector<hipEvent_t> const&       stopEvents);
+                                     std::vector<hipEvent_t> const&       stopEvents,
+                                     KernelGraphInvocation* kernel_graph_invocation = nullptr);
+            
 
             hipError_t initKernel(std::string const& name);
 
@@ -99,6 +103,80 @@ namespace Tensile
 
             friend std::ostream& operator<<(std::ostream& stream, SolutionAdapter const& adapter);
         };
+        
+        inline void load_scalar(void* KernelGraphInfo , const std::string& name) 
+        {
+            auto graphInfo = (KernelGraphInvocation*)KernelGraphInfo;
+            void* arg = nullptr;
+            DataType argType = DataType::None; 
+
+            if(name == "alpha")
+            {   
+                arg = graphInfo->alpha;
+                argType = graphInfo->alphaType;
+            }
+            else if (name == "beta")
+            {
+                arg = graphInfo->beta;
+                argType = graphInfo->betaType;
+            }
+             
+            if(argType == DataType::Float || argType == DataType::BFloat16 )
+            {
+                auto value = *static_cast<float*>(arg);
+                graphInfo->kArgs->updateValue<float>(name, value);
+            }
+            else if(argType == DataType::Double)
+            {
+                auto value = *static_cast<double*>(arg);
+                graphInfo->kArgs->updateValue<double>(name, value);
+            }
+            else if(argType == DataType::ComplexFloat)
+            {
+                auto value = *static_cast<std::complex<float>*>(arg);
+                graphInfo->kArgs->updateValue<std::complex<float>>(name, value);
+            }
+            else if(argType == DataType::ComplexDouble)
+            {
+                auto value = *static_cast<std::complex<double>*>(arg);
+                graphInfo->kArgs->updateValue<std::complex<double>>(name, value);
+            }
+            else if(argType == DataType::Int32)
+            {
+                auto value = *static_cast<int32_t*>(arg);
+                graphInfo->kArgs->updateValue<float>(name, value);           
+            }
+            else if(argType == DataType::Half)
+            {
+                auto value = *static_cast<float*>(arg);
+                graphInfo->kArgs->updateValue<float>(name, value);
+                if(!graphInfo->isSourceKernel)
+                {
+                    std::string name_2 = name + "_2";
+                    graphInfo->kArgs->updateValue<float>(name_2, value);
+                }
+            }
+            else 
+            {
+                throw std::runtime_error( " Type mismatch for Argument : "  + name );            
+            }
+        }
+    
+        inline void updateKernelArgsFuncCB(void* KernelGraphInfo)
+        {
+            auto graphInfo = (KernelGraphInvocation*)KernelGraphInfo;
+            load_scalar(KernelGraphInfo, "alpha");
+            load_scalar(KernelGraphInfo, "beta");
+           // graphInfo->kArgsSize = graphInfo->kArgs->size();
+        }
+
+        inline void deleteKernelArgsObjFuncCB(void* kernel_graph_info)
+        {
+            std::cout <<" RK: Delete Kernel Arguments ... " << std::endl;
+            auto graphInfo = (KernelGraphInvocation*)kernel_graph_info;
+           // std::cout <<" RK: arg size : " << graphInfo->kArgsSize << std::endl;
+            delete graphInfo->kArgs;
+        }
 
         std::ostream& operator<<(std::ostream& stream, SolutionAdapter const& adapter);
         std::ostream& operator<<(std::ostream& stream, std::shared_ptr<SolutionAdapter> const& ptr);

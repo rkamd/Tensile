@@ -55,6 +55,9 @@ namespace Tensile
         template <typename T>
         void bind(std::string const& name, T value);
 
+        template <typename T>
+        void updateValue(std::string const& name, T value);
+
         bool isFullyBound() const;
 
         void const* data() const;
@@ -108,6 +111,9 @@ namespace Tensile
 
         template <typename T>
         void append(std::string const& name, T value, bool bound);
+
+        template <typename T>
+        void updateValue(std::string const& name, T value, bool bound);
 
         template <typename T>
         std::string stringForValue(T value, bool bound);
@@ -177,6 +183,39 @@ namespace Tensile
 
         std::get<ArgString>(record) = stringForValue(value, true);
         std::get<ArgBound>(record)  = true;
+    }
+
+     template <typename T>
+     inline void KernelArguments::updateValue(std::string const& name, T value)
+    {
+        updateValue(name , value, true);
+    }
+
+    template<typename T> 
+    inline void KernelArguments::updateValue(std::string const& name, T value, bool bound)
+    {
+        auto it = m_argRecords.find(name);
+        if(it == m_argRecords.end())
+        {
+            throw std::runtime_error("Record " + name + " not found");
+        }
+        
+        auto& record = it->second;
+        size_t offset = std::get<ArgOffset>(record);
+        size_t size = std::get<ArgSize>(record);
+        
+        if(offset % alignof(T) != 0)
+        {
+            throw std::runtime_error("Alignment error in argument " + name + ": type mismatch?");
+        }
+
+        if(m_log)
+        {
+            std::string valueString = stringForValue(value, bound);
+            m_argRecords[name] = Arg(offset, size, bound, valueString);
+        }
+
+        writeValue(offset, value);
     }
 
     template <typename T>

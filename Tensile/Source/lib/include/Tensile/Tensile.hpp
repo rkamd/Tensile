@@ -131,6 +131,18 @@ namespace Tensile
         KernelArguments args;
     };
 
+    struct TENSILE_API KernelGraphInvocation
+    {
+      public:
+         void *alpha;
+         void *beta;
+         KernelArguments *kArgs;
+         DataType alphaType;
+         DataType betaType;
+         bool isSourceKernel;
+         size_t kArgsSize;
+    };
+
     /**
  * \ingroup Tensile
  * \defgroup Hardware Hardware Description Classes
