@@ -107,6 +107,7 @@ def getAssemblyCodeObjectFiles(kernels, kernelWriterAssembly, outputPath):
             coFileMap[os.path.join(destDir, coName+".co")] += [kernelWriterAssembly.getKernelFileBase(kernel) + '.o']
 
         for coFile, objectFiles in coFileMap.items():
+          args = []
           if os.name == "nt":
             # On Windows, the objectFiles list command line (including spaces)
             # exceeds the limit of 8191 characters, so using response file
@@ -117,23 +118,17 @@ def getAssemblyCodeObjectFiles(kernels, kernelWriterAssembly, outputPath):
               file.write( " ".join(responseArgs) )
               file.flush()
 
-            args = [globalParameters['AssemblerPath'], '-target', 'amdgcn-amd-amdhsa', '-o', coFile, '@clangArgs.txt']
-            # change to use  check_output to force windows cmd block util command finish
-            try:
-              out = subprocess.check_output(args, stderr=subprocess.STDOUT, cwd=asmDir)
-              print2(out)
-            except subprocess.CalledProcessError as err:
-              print(err.output)
-              raise
+            args = kernelWriterAssembly.getLinkCodeObjectArgs(['@clangArgs.txt'], coFile)
           else:
             args = kernelWriterAssembly.getLinkCodeObjectArgs(objectFiles, coFile)
-            # change to use  check_output to force windows cmd block util command finish
-            try:
-              out = subprocess.check_output(args, stderr=subprocess.STDOUT, cwd=asmDir)
-              print2(out)
-            except subprocess.CalledProcessError as err:
-              print(err.output)
-              raise
+
+          # change to use  check_output to force windows cmd block util command finish
+          try:
+            out = subprocess.check_output(args, stderr=subprocess.STDOUT, cwd=asmDir)
+            print2(out)
+          except subprocess.CalledProcessError as err:
+            print(err.output)
+            raise
 
           coFiles.append(coFile)
       else:
@@ -327,13 +322,11 @@ def buildSourceCodeObjectFile(CxxCompiler, outputPath, kernelFile):
         shutil.copyfile(src, dst)
 
     return destCosList
-
-def buildSourceCodeObjectFiles(CxxCompiler, kernelFiles, outputPath):
-    args = zip(itertools.repeat(CxxCompiler), itertools.repeat(outputPath), kernelFiles)
-
-    coFiles = Common.ParallelMap(buildSourceCodeObjectFile, args, "Compiling source kernels",
-                                 method=lambda x: x.starmap)
-
+  
+def buildSourceCodeObjectFiles(CxxCompiler, kernelFiles, outputPath):  
+    args    = zip(itertools.repeat(CxxCompiler), itertools.repeat(outputPath), kernelFiles)
+    coFiles = Common.ParallelMap(buildSourceCodeObjectFile, args, "Compiling source kernels")
+    
     return itertools.chain.from_iterable(coFiles)
 
 ################################################################################
@@ -523,8 +516,8 @@ def writeSolutionsAndKernels(outputPath, CxxCompiler, problemTypes, solutions, k
         objFilenames.add(base)
         kernel.duplicate = False
 
-  kIter = zip(kernels, itertools.repeat(kernelWriterSource), itertools.repeat(kernelWriterAssembly))
-  results = Common.ParallelMap(processKernelSource, kIter, "Generating kernels", method=lambda x: x.starmap, maxTasksPerChild=1)
+  kIter   = zip(kernels, itertools.repeat(kernelWriterSource), itertools.repeat(kernelWriterAssembly))
+  results = Common.ParallelMap(processKernelSource, kIter, "Generating kernels")
 
   removeKernels = []
   removeSolutions = []
@@ -532,9 +525,14 @@ def writeSolutionsAndKernels(outputPath, CxxCompiler, problemTypes, solutions, k
   for kernIdx, res in Utils.tqdm(enumerate(results)):
     (err,src,header,kernelName, filename) = res
     if(err == -2):
+      if not errorTolerant:
+        print("\nKernel generation failed for kernel: {}".format(kernels[kernIdx]["SolutionIndex"]))
+        print(kernels[kernIdx]["SolutionNameMin"])
       removeKernels.append(kernels[kernIdx])
       removeSolutions.append(solutions[kernIdx])
       removeResults.append(results[kernIdx])
+  if len(removeKernels) > 0 and not errorTolerant:
+    printExit("** kernel generation failure **")
   for kern in removeKernels:
       kernels.remove(kern)
   for solut in removeSolutions:
@@ -551,8 +549,7 @@ def writeSolutionsAndKernels(outputPath, CxxCompiler, problemTypes, solutions, k
           kernelName = writer.getKernelName(kernel)
           return kernelName not in kernelsWithBuildErrs
       kernelsToBuild = list(filter(success, kernelsToBuild))
-
-  if False:#len(kernelsWithBuildErrs) > 0:
+  elif len(kernelsWithBuildErrs) > 0:
     print("\nKernel compilation failed in one or more subprocesses. May want to set CpuThreads=0 and re-run to make debug easier")
     printExit("** kernel compilation failure **")
 
@@ -1042,11 +1039,8 @@ def generateKernelObjectsFromSolutions(solutions):
 # Generate Logic Data and Solutions
 ################################################################################
 def generateLogicDataAndSolutions(logicFiles, args):
-
-  libraries = Common.ParallelMap(LibraryIO.parseLibraryLogicFile, logicFiles, "Reading logic files")
-
+  libraries = Common.ParallelMap(LibraryIO.parseLibraryLogicFile, logicFiles, "Reading logic files", multiArg=False)
   solutions = []
-
   masterLibraries = {}
   fullMasterLibrary = None
 

@@ -1,6 +1,6 @@
 ################################################################################
 #
-# Copyright (C) 2016-2022 Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2016-2023 Advanced Micro Devices, Inc. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -1873,7 +1873,6 @@ class Solution(collections.abc.Mapping):
       state["MatrixInstBM"]        = state["MIBlock"][4]
       state["MatrixInstBN"]        = state["MIBlock"][5]
 
-      state["LocalSplitU"]         = 1
       state["MIOutputVectorWidth"], state["MIRegPerOut"] = Solution.getMIOutputInfo(state)
 
       if state["MatrixInstM"] == 4:
@@ -1893,12 +1892,21 @@ class Solution(collections.abc.Mapping):
 
       state["SubGroup0"]   = state["WorkGroup"][0]
       state["SubGroup1"]   = state["WorkGroup"][1]
-      state["LocalSplitU"] = state["WorkGroup"][2]
+
+    state["LocalSplitU"] = state["WorkGroup"][2]
+    # enable MatrixInstruction store only for LSU=1
+    # LSU>1 case, use non-MI store instead
+    state["EnableMatrixInstructionStore"] = EnableMatrixInstruction and state["LocalSplitU"]==1
 
     if "SubGroup0" in state and "SubGroup1" in state and "LocalSplitU" in state:
       state["NumThreads"]  = state["SubGroup0"] * state["SubGroup1"] * state["LocalSplitU"]
       if (state["NumThreads"] % state['WavefrontSize']) != 0:
         reject(state, f"size of WorkGroup {state['NumThreads']} should be multiple of WavefrontSize {state['WavefrontSize']}")
+      if EnableMatrixInstruction == True:
+        if ((state["SubGroup0"] * state["SubGroup1"]) % state['WavefrontSize']) != 0:
+          reject(state, f"SubGroup0 {state['SubGroup0']} * SubGroup1 {state['SubGroup1']}should be multiple of WavefrontSize {state['WavefrontSize']}")
+        if (state["LocalSplitU"] > 4):
+          reject(state, f"LocalSplitU {state['LocalSplitU']} should not be larger than 4 with MatrixInstruction")
 
     # macro tile sizes
     if "SubGroup0" in state and "ThreadTile0" in state:
@@ -1996,7 +2004,7 @@ class Solution(collections.abc.Mapping):
         if state["ProblemType"]["TLU%s"%tc]:
           nlcStart = roundupRatio(state["MIWaveTile%s"%tc], state["GlobalLoadVectorWidth%s"%tc])
         else:
-          nlcStart = roundupRatio(state["DepthU"], state["MatrixInstK"] * state["GlobalLoadVectorWidth%s"%tc])
+          nlcStart = roundupRatio(state["DepthU"], state["MatrixInstK"] * state["GlobalLoadVectorWidth%s"%tc] * state["LocalSplitU"])
       for nlc in range(nlcStart, int(state["NumLoads%s"%tc]+1)):
         nlp = state["NumLoads%s"%tc] // nlc
         if state["NumLoads%s"%tc] % nlc == 0 \
@@ -2146,13 +2154,13 @@ class Solution(collections.abc.Mapping):
       # Per instruction across the entire group:
       elementsLoadedPerInst = state["NumThreads"]*grvw
       if (state["DirectToVgpr%s"%tc] and state["ProblemType"]["TLU%s"%tc]):
-        elementsLoadedPerInst //= state["MatrixInstK"]
+        elementsLoadedPerInst //= state["MatrixInstK"] * state["LocalSplitU"]
       # LSC, LSP - #elements loaded along specified dim with each load
       if parDim >= elementsLoadedPerInst:
         # entire work-group can work on (part) of the same row
-        # DirectToVgpr case, LSC is limited to elementsLoadedPerInst // state["MatrixInstK"]
+        # DirectToVgpr case, LSC is limited to elementsLoadedPerInst // (state["MatrixInstK"] * state["LocalSplitU"])
         state["LSC%s"%tc] = elementsLoadedPerInst
-        state["LSP%s"%tc] = 1 if not (state["DirectToVgpr%s"%tc] and state["ProblemType"]["TLU%s"%tc]) else state["MatrixInstK"]
+        state["LSP%s"%tc] = 1 if not (state["DirectToVgpr%s"%tc] and state["ProblemType"]["TLU%s"%tc]) else state["MatrixInstK"] * state["LocalSplitU"]
         state["NumLoadsCoalesced%s"%tc] = roundupRatio(parDim , state["LSC%s"%tc])
         state["NumLoadsPerpendicular%s"%tc] = 1
       else:
@@ -2175,7 +2183,7 @@ class Solution(collections.abc.Mapping):
         while grvw >= minGrvw:
           elementsLoadedPerInst = state["NumThreads"]*grvw
           if state["DirectToVgpr%s"%tc] and state["ProblemType"]["TLU%s"%tc]:
-            elementsLoadedPerInst //= state["MatrixInstK"]
+            elementsLoadedPerInst //= state["MatrixInstK"] * state["LocalSplitU"]
           if elementsLoadedPerInst < validElementsLoadedPerInst:
             break # Went too far, not enough load elements at this VW
           if state["LSC%s"%tc] % grvw == 0:
@@ -2297,7 +2305,7 @@ class Solution(collections.abc.Mapping):
       state["MIBlock"][5] = MIBlock_BN
 
       # set MIWaveGroup
-      numOfWave                = (state["WorkGroup"][0] * state["WorkGroup"][1]) // state["WavefrontSize"]
+      numOfWave                = max((state["WorkGroup"][0] * state["WorkGroup"][1]) // state["WavefrontSize"], 1) # should be >0
       state['MIWaveGroup']     = [1, 1]
       state['MIWaveGroup'][0]  = min((miwg0 // state["MatrixInstruction"][0]) // MIBlock_BM, numOfWave)
       state['MIWaveGroup'][1]  = numOfWave // state['MIWaveGroup'][0]
@@ -2347,6 +2355,12 @@ class Solution(collections.abc.Mapping):
   def isDirectToVgprDoable(state, tc):
     tcOther = 'B' if tc == 'A' else 'A'
     MIindex = 0 if tc == 'A' else 1
+    # Does not support DirectToVgprA+DirectToVgprB+PrefetchGlobalRead=2
+    # Need more than double-vgpr buffers to avoid overwritting loaded data on vgpr
+    if state["DirectToVgprA"] and state["DirectToVgprB"] and state["PrefetchGlobalRead"]==2:
+      reject(state, "DirectToVgprA + DirectToVgprB + PrefetchGlobalRead=2 is not supported")
+      return False
+
     # With MatrixInstruction only (tentative)
     if not state["EnableMatrixInstruction"] :
       reject(state, "DirectToVgpr is for MatrixInstruction only")
@@ -2371,11 +2385,11 @@ class Solution(collections.abc.Mapping):
     #  for A, MIWaveGroup should be [4, 1]
     #  for B, MIWaveGroup should be [1, 4]
     # This is to limit the number of Vgpr
-    if tc == 'A' and not (state['MIWaveGroup'][0] == 4 and state['MIWaveGroup'][1] == 1):
-      reject(state, "MIWaveGroup should be [4, 1] for DirectToVgprA. Current value is [%s]"%state['MIWaveGroup'])
+    if tc == 'A' and not (state['MIWaveGroup'][1] == 1):
+      reject(state, "MIWaveGroup[1] should be 1 for DirectToVgprA. Current value is [%s]"%state['MIWaveGroup'][1])
       return False
-    if tc == 'B' and not (state['MIWaveGroup'][0] == 1 and state['MIWaveGroup'][1] == 4):
-      reject(state, "MIWaveGroup should be [1, 4] for DirectToVgprB. Current value is [%s]"%state['MIWaveGroup'])
+    if tc == 'B' and not (state['MIWaveGroup'][0] == 1):
+      reject(state, "MIWaveGroup[0] should be 1 for DirectToVgprB. Current value is [%s]"%state['MIWaveGroup'][0])
       return False
 
     # Does not support MatrixInstBM, MatrixInstBN > 1
@@ -2424,14 +2438,14 @@ class Solution(collections.abc.Mapping):
       reject(state, "DirectToVgpr%c does not supports FractionalLoad + TLU=False"%(tc))
       return False
 
-    # Does not work with TLU=False and PGR=2 and DepthU<=MatrixInstK*VW
-    if (not state["ProblemType"]["TLU%c"%tc]) and state["PrefetchGlobalRead"] == 2 and state["DepthU"] <= state["MatrixInstK"] * state["VectorWidth"]:
-      reject(state, "DirectToVgpr%c does not supports TLU=False and PrefetchGlobalRead==2 and DepthU<=MatrixInstK*VectorWidth"%(tc))
+    # Does not work with TLU=False and PGR=2 and DepthU<=MatrixInstK*VW*LSU
+    if (not state["ProblemType"]["TLU%c"%tc]) and state["PrefetchGlobalRead"] == 2 and state["DepthU"] <= state["MatrixInstK"] * state["VectorWidth"] * state["LocalSplitU"]:
+      reject(state, "DirectToVgpr%c does not supports TLU=False and PrefetchGlobalRead==2 and DepthU<=MatrixInstK*VectorWidth*LocalSplitU"%(tc))
       return False
 
-    # Does not work with TLU=False and NumLoadsCoalesced != DepthU//(MatrixInstK*VW)
-    if (not state["ProblemType"]["TLU%c"%tc]) and state["NumLoadsCoalesced%c"%tc] != state["DepthU"] // (state["MatrixInstK"] * state["VectorWidth"]):
-      reject(state, "DirectToVgpr%c does not supports TLU=False and NumLoadsCoalesced%c != DepthU//(MatrixInstK*VectorWidth)"%(tc, tc))
+    # Does not work with TLU=False and NumLoadsCoalesced != DepthU//(MatrixInstK*VW*LSU)
+    if (not state["ProblemType"]["TLU%c"%tc]) and state["NumLoadsCoalesced%c"%tc] != state["DepthU"] // (state["MatrixInstK"] * state["VectorWidth"] * state["LocalSplitU"]):
+      reject(state, "DirectToVgpr%c does not supports TLU=False and NumLoadsCoalesced%c != DepthU//(MatrixInstK*VectorWidth*LocalSplitU)"%(tc, tc))
       return False
 
     # Both TLU=False + TransposeLDS case, need GlobalLoadVectorWidth == LocalReadVectorWidth
@@ -2455,6 +2469,11 @@ class Solution(collections.abc.Mapping):
       reject(state, "DirectToVgpr%c does not supports ScheduleIterAlg < 3 and PrefetchGlobalRead==2"%(tc))
       return False
 
+    # Does not work with DirectToVgprB + SourceSwap=False + VectorWidth>1
+    if tc == 'B' and (not state["SourceSwap"]) and state["VectorWidth"]>1:
+      reject(state, "DirectToVgpr%c does not supports SourceSwap=False and VectorWidth>1"%(tc))
+      return False
+
     # Does not work with DirectToLDS
     # -> this will be checked after DirectToLDS doable check is done
 
@@ -2465,6 +2484,8 @@ class Solution(collections.abc.Mapping):
   @staticmethod
   def isDirectToLdsDoable(state, tc):
     numBytes = state["ProblemType"]["DataType"].numBytes()
+    asem = state["AssertSummationElementMultiple"]
+    gsu = state["GlobalSplitU"]
 
     # x2/x4 support for directToLds (no longer supported)
 
@@ -2482,14 +2503,10 @@ class Solution(collections.abc.Mapping):
       reject(state, "DirectToLds can only be used with buffer loads requiring 1 register")
       return False
 
-    if state["ProblemType"]["DataType"].isHalf():
-      if state["AssertSummationElementMultiple"] % (2 * state["GlobalLoadVectorWidth%c"%tc])  != 0:
-        reject(state, "can't use DirectToLds for FP16 with AssertSummationElementMultiple %u" % state["AssertSummationElementMultiple"])
+    if (state["ProblemType"]["DataType"].isHalf() or state["ProblemType"]["DataType"].isBFloat16()) and state["ProblemType"]["TLU%c"%tc] == False:
+      if (asem % gsu != 0) or ((asem//gsu) % (state["GlobalLoadVectorWidth%c"%tc])  != 0):
+        reject(state, "can't use DirectToLds for FP16/BF16 with TLU%c=False and AssertSummationElementMultiple=%u and GlobalSplitU=%u" % (tc, asem, gsu))
         return False
-
-    if state["ProblemType"]["DataType"].isBFloat16() and state["AssertSummationElementMultiple"] % (2 * state["GlobalLoadVectorWidth%c"%tc]) != 0:
-      reject(state, "can't use DirectToLds for BF16 with AssertSummationElementMultiple %u" % state["AssertSummationElementMultiple"])
-      return False
 
     if state["NumThreads"] % state["WavefrontSize"] != 0:
       reject(state, "can't use DirectToLds for NumThreads % WavefrontSize != 0")
@@ -2546,10 +2563,10 @@ class Solution(collections.abc.Mapping):
         reject(state, "DirectToLds%c does not supports NumLoadsCoalesced%c > 1 and UseInstOffsetForGRO for dgemm"%(tc, tc))
         return False
 
-    # Does not work with PAPMode 1 and AssertSummationElementMultiple % (DepthU * 2) != 0
+    # Does not work with PAPMode 1 and (AssertSummationElementMultiple/GlobalSplitU) % (DepthU * 2) != 0
     # This is because DirectToLds use second LDS buffer after Odd exit. It does not match local read at the beginning of PK loop.
-    if state["PrefetchAcrossPersistentMode"] == 1 and state["AssertSummationElementMultiple"] % (state["DepthU"] * 2) != 0:
-      reject(state, "DirectToLds%c does not work with PAPMode 1 and AssertSummationElementMultiple is not multiple of (DepthU * 2)"%(tc))
+    if state["PrefetchAcrossPersistentMode"] == 1 and ((asem%gsu != 0) or ((asem//gsu) % (state["DepthU"] * 2) != 0)):
+      reject(state, "DirectToLds%c does not work with PAPMode 1 and (AssertSummationElementMultiple//GlobalSplitU) is not multiple of (DepthU * 2)"%(tc))
       return False
 
     # Does not work with PrefetchGlobalRead=2 and PrefetchLocalRead=1 (cannot schedule DTL global read after local read)
@@ -2587,6 +2604,11 @@ class Solution(collections.abc.Mapping):
        numBytes * state["GlobalLoadVectorWidth%c"%tc] > bpr and \
        state["DepthU"] // state["NumLoadsCoalesced%c"%tc] <= 8 * numElementPerReg:
       reject(state, "DirectToLds%c does not work with TLU=False and bpe * GLVW > bpr and DepthU//NumLoadsCoalesced%c <= 8 * numElementPerReg(%u)"%(tc, tc, numElementPerReg))
+      return False
+
+    # Does not work with LocalSplitU
+    if state["LocalSplitU"] > 1:
+      reject(state, "DirectToLds%c does not work with LocalSplitU>1"%(tc))
       return False
 
     return True
@@ -2633,11 +2655,11 @@ class Solution(collections.abc.Mapping):
         computeBytes = state["ProblemType"]["ComputeDataType"].numBytes()
 
         if state["GlobalSplitUAlgorithm"] == 'SingleBuffer':
-          # For SingleBuffer algorithm, _GA and _WorkspaceSizePerElemC is updated only if the gemm function is HPA (excludig int8). 
-          # The worskspace is used to convert the final output from ComputeDataType to DestDataType. For non-HPA gemm functions 
-          # the _GA and _Workspace remain unchanged.
-          # for HPA cases (excluding 4xi8/I8II): HHS/BBS/BSS/HSS (_GA should be singlebuffer for these types)
-          if (not state["ProblemType"]["DestDataType"].isInt32() and computeName != state["ProblemType"]["DataType"].toName()):
+          # For SingleBuffer algorithm, _GA and _WorkspaceSizePerElemC is updated only if the gemm function is HPA (excluding int8). 
+          # The workspace is used to convert the final output from ComputeDataType to DestDataType.
+          # If ComputeDataType and DestDataType are the same ,the _GA and _Workspace remain unchanged.
+          # for HPA cases with ComputeDataType!=DestDataType : HHS/BBS (_GA should be singlebuffer for these types)
+          if (computeName != state["ProblemType"]["DestDataType"].toName()):
             state["_GlobalAccumulation"] = 'SingleBuffer'
             state["_WorkspaceSizePerElemC"] = computeBytes
         elif state["GlobalSplitUAlgorithm"] == 'MultipleBuffer':
@@ -2857,17 +2879,9 @@ class Solution(collections.abc.Mapping):
 
     bufferLoad = state["BufferLoad"] and state["KernelLanguage"] == "Assembly"
     if not bufferLoad:
-      if state["KernelLanguage"] == "Assembly" and state["ProblemType"]["DataType"].numBytes() < 4:
-        reject(state, "BufferLoad=0 does not support DataType.numBytes < 4")
-        return
       state["DirectToLds"] = False
       state["_UseSgprForGRO"] = False
       state["FractionalLoad"] = False
-
-    if not state["BufferStore"]:
-      if state["KernelLanguage"] == "Assembly" and state["ProblemType"]["DestDataType"].numBytes() < 4:
-        reject(state, "BufferStore=0 does not support DestDataType.numBytes < 4")
-        return
 
     #These modes only work under certain conditions, apply them here:
     #  - The "NoLoad" loop is only generated if PrefetchGlobalRead>0
@@ -3046,26 +3060,40 @@ class Solution(collections.abc.Mapping):
         (state["ProblemType"]["DataType"].isSingle()) or \
         (state["ProblemType"]["DataType"].isDouble() and state["BufferStore"]) or \
         (state["ProblemType"]["DestDataType"].isInt32()) or \
-        (state["KernelLanguage"] == "Assembly" and
-            (state["ProblemType"]["DataType"].isHalf() and not state["ProblemType"]["HighPrecisionAccumulate"]) or
-            (state["_GlobalAccumulation"])
-        )
+        (state["KernelLanguage"] == "Assembly" and state["ProblemType"]["ComputeDataType"].isHalf()) or \
+        (state["_GlobalAccumulation"]) or \
+        (state["EnableMatrixInstruction"]) # MFMA case, support all data types with BufferStore=0 or 1
+
       if not supported:
-        reject(state, "GlobalSplitU only compatible with single or asm and (half or mixed) precision")
+        reject(state, "GlobalSplitU only compatible with single, or asm and (half or mixed) precision, or EnableMatrixInstruction")
         return
 
     # to eliminate identical/duplicate kernels when GSU=1 but GlobalSplitUAlgorithm is MultipleBuffer
     if state["GlobalSplitU"] == 1 and state["GlobalSplitUAlgorithm"] == 'MultipleBuffer':
       reject(state, " GlobalSplitU=1 and GlobalSplitUAlgorithm='MultipleBuffer'. Rejecting GlobalSplitUAlgorithm='SingleBuffer' to avoid duplicate kernels.")
 
+    # set minimum and maximum of VectorAtomicWidth
+    minVectorAtomicWidth = 2 if (state["ProblemType"]["ComputeDataType"].numBytes() == 2) else 1
+    #  TODO: enable wider VectorAtomicWidth
+    maxVectorAtomicWidth = max(state["GlobalWriteVectorWidth"], minVectorAtomicWidth)
+    useAtomic = state["GlobalSplitU"] > 1 and state["GlobalSplitUAlgorithm"] == 'SingleBuffer'
     if state["VectorAtomicWidth"] == -1:
-      state["VectorAtomicWidth"] = 1 # TODO - remove this and next line when VAW works for other types
-      if state["ProblemType"]["DataType"].isHalf() and (not state["_GlobalAccumulation"]):
-        state["VectorAtomicWidth"] = 2
+      if useAtomic:
+        # atomic case, use max
+        state["VectorAtomicWidth"] = maxVectorAtomicWidth
+      else:
+        # not atomic case, this is not used. Set min
+        state["VectorAtomicWidth"] = minVectorAtomicWidth
 
-    if state["VectorAtomicWidth"] >= 2 \
-       and not (state["ProblemType"]["DataType"].isHalf() or state["ProblemType"]["DataType"].isBFloat16()):
-         reject (state, "VectorAtomicWidth>=2 only supported for half")
+    if state["VectorAtomicWidth"] < minVectorAtomicWidth:
+      reject(state, "VectorAtomicWidth should not be smaller than min(=%u)"%minVectorAtomicWidth)
+    if state["VectorAtomicWidth"] > maxVectorAtomicWidth:
+      reject(state, "VectorAtomicWidth should not be larger than max(=%u)"%maxVectorAtomicWidth)
+    if (not useAtomic) and state["VectorAtomicWidth"] > minVectorAtomicWidth:
+      reject(state, "Rejecting (GlobalSplitU=1 or MultipleBuffer) and VectorAtomicWidth>min(=%u) to avoid duplicate kernels."%minVectorAtomicWidth)
+
+    if useAtomic and state["VectorAtomicWidth"] > state["GlobalWriteVectorWidth"]:
+      reject (state, "GSU + SingleBuffer + VectorAtomicWidth(%u) > GlobalWriteVectorWidth(%u) not supported"%(state["VectorAtomicWidth"], state["GlobalWriteVectorWidth"]))
 
     if state["ProblemType"]["DataType"].isHalf() and state["KernelLanguage"] == "Assembly":
 
@@ -3322,7 +3350,7 @@ class Solution(collections.abc.Mapping):
       VectorWidthB = state["VectorWidth"]
     elif state["DirectToVgprA"]:
       VectorWidthB = state["LocalReadVectorWidth"]
-    state["allowLRVWBforTLUandMI"] = (state["DirectToVgprB"] and \
+    state["allowLRVWBforTLUandMI"] = (state["DirectToVgprB"] or \
                                        (state["ProblemType"]["TLUA"] and state["LocalReadVectorWidth"] == 1 or \
                                         not state["ProblemType"]["TLUA"]) or \
                                       state["DirectToVgprA"] and not state["DirectToLds"]) and \
@@ -3411,7 +3439,7 @@ class Solution(collections.abc.Mapping):
       validNoTailLoop = False
       invalidComment = "does not support TLUA=False and TLUB=False"
     # NoTailLoop parameter initialization. Set True for the following cases
-    #  1. ASEM is multiple of DepthU. TailLoop code will not be used in this case.
+    #  1. ASEM%GSU=0 and ASEM/GSU is multiple of DepthU. TailLoop code will not be used in this case.
     #  2. PrefetchAcrossPersistent and PrefetchAcrossPersistentMode
     #    PrefetchAcrossPersistentMode does not support TailLoop (TLU is necessary for NoTailLoop)
     #  3. DirectToVgpr is enabled
@@ -3420,17 +3448,19 @@ class Solution(collections.abc.Mapping):
     # Except for case 1, validNoTailLoop should be True to enable NoTailLoop.
     # Otherwise, it will be rejected.
     state["NoTailLoop"] = False
-    if state["AssertSummationElementMultiple"] % state["DepthU"] == 0:
+    asem = state["AssertSummationElementMultiple"]
+    gsu = state["GlobalSplitU"]
+    if (asem % gsu == 0) and ((asem//gsu) % state["DepthU"] == 0):
       state["NoTailLoop"] = True
     elif state["PersistentKernel"] and state["PrefetchAcrossPersistent"] and state["PrefetchAcrossPersistentMode"] == 1:
       if not validNoTailLoop:
-        reject(state, "PAP + PAPMode + AssertSummationElementMultiple%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
+        reject(state, "PAP + PAPMode + (AssertSummationElementMultiple/GlobalSplitU)%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
         return
       else:
         state["NoTailLoop"] = True
     elif state["DirectToVgprA"] or state["DirectToVgprB"]:
       if not validNoTailLoop:
-        reject(state, "DirectToVgpr + AssertSummationElementMultiple%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
+        reject(state, "DirectToVgpr + (AssertSummationElementMultiple/GlobalSplitU)%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
         return
       else:
         state["NoTailLoop"] = True
@@ -3438,13 +3468,13 @@ class Solution(collections.abc.Mapping):
       for tc in ('A','B'):
         if state["ProblemType"]["TLU%c"%tc] and state["NumLoadsCoalesced%c"%tc] > 1:
           if not validNoTailLoop:
-            reject(state, "DirectToLds + TLU + NumLoadsCoalesced>1 + AssertSummationElementMultiple%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
+            reject(state, "DirectToLds + TLU + NumLoadsCoalesced>1 + (AssertSummationElementMultiple/GlobalSplitU)%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
             return
           else:
             state["NoTailLoop"] = True
-        elif state["LocalReadVectorWidth"] > 1:
+        elif state["EnableMatrixInstruction"] and state["LocalReadVectorWidth"] > state["MIInputPerThread"]:
           if not validNoTailLoop:
-            reject(state, "DirectToLds + LocalReadVectorWidth>1 + AssertSummationElementMultiple%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
+            reject(state, "DirectToLds + LocalReadVectorWidth>MIInputPerThread + (AssertSummationElementMultiple/GlobalSplitU)%%DepthU!=0 %s to enable NoTailLoop"%invalidComment)
             return
           else:
             state["NoTailLoop"] = True
@@ -3514,10 +3544,9 @@ class Solution(collections.abc.Mapping):
         #1LDS buffer must be 0 for DirectToLdsA
         state["1LDSBuffer"] = 0
 
-    # set NoLdsWriteCode if DirectToLds + DirectToVgpr or DirectToLdsA+B is enabled
+    # set NoLdsWriteCode if both A and B use DirectToLds or DirectToVgpr
     state["NoLdsWriteCode"] = False
-    if (state["DirectToVgprA"] and state["DirectToLdsB"]) or (state["DirectToVgprB"] and state["DirectToLdsA"]) or \
-        (state["DirectToLdsA"] and state["DirectToLdsB"]):
+    if (state["DirectToVgprA"] or state["DirectToLdsA"]) and (state["DirectToVgprB"] or state["DirectToLdsB"]):
       state["NoLdsWriteCode"] = True
 
     # Default LocalReadVectorWidth
@@ -3619,7 +3648,8 @@ class Solution(collections.abc.Mapping):
       state["LdsOffsetB"] = state["LdsOffsetA"] + state["LdsNumElementsAlignedA"]
 
       offsetBlk = state["LdsOffsetB"] + ldsNumElementsAlignedB
-      offsetBlk = int(2**(math.ceil(math.log(offsetBlk, 2))))
+      if offsetBlk>0: # need 0 check to avoid an error
+        offsetBlk = int(2**(math.ceil(math.log(offsetBlk, 2))))
 
       state["LdsOffsetA_Blk"] = offsetBlk
       state["LdsOffsetB_Blk"] = state["LdsOffsetA_Blk"] + state["LdsNumElementsAlignedA"]
@@ -3720,6 +3750,13 @@ class Solution(collections.abc.Mapping):
       if state["StoreRemapVectorWidth"]:
         reject(state, "SourceSwap not compatible with StoreRemap")
         return
+    # non-SourceSwap+MFMA 4x4 check
+    if (not state["SourceSwap"]) and state["EnableMatrixInstruction"]:
+      if state["MatrixInstBM"] > 1 and state["MatrixInstN"] == 4 and (state["MatrixInstM"] > state["MIOutputVectorWidth"]) and \
+        state["AssertFree0ElementMultiple"] % state["GlobalLoadVectorWidthA"] != 0:
+        reject(state, "MI4x4 + non-SourceSwap + MatrixInstBM > 1 + MatrixInstN == 4 + MatrixInstM > MIOutputVectorWidth \
+                       AssertFree0ElementMultiple %% bGlobalLoadVectorWidthA != 0 not supported")
+        return
 
     # check if need to use lds init Acc vgprs
     state["LdsInitCVgprs"] = False
@@ -3735,6 +3772,9 @@ class Solution(collections.abc.Mapping):
     if state["MIArchVgpr"]:
       if not state["EnableMatrixInstruction"]:
         reject(state, "MIArchVgpr only support for MatrixInstruction")
+        return
+      if not (globalParameters["AsmCaps"][isa]["HasMFMA_vgpr"] or globalParameters["AsmCaps"][isa]["HasWMMA"]):
+        reject(state, "MIArchVgpr is not supported by this arch")
         return
       if globalParameters["AsmCaps"][isa]["HasMFMA"]:
         if not (state["ProblemType"]["ComputeDataType"].isDouble() or \
@@ -3860,6 +3900,9 @@ class Solution(collections.abc.Mapping):
     if state["StoreCInUnroll"]:
       if not (state["ProblemType"]["DataType"].isDouble() or state["ProblemType"]["DataType"].isDoubleComplex()):
         reject(state, "StoreCInUnroll currently only available for dgemm/zgemm")
+        return
+      if state["LocalSplitU"]>1:
+        reject(state, "LocalSplitU is not supported for StoreCinUnroll")
         return
       if state["MIArchVgpr"]:
         reject(state, "MIArchVgpr is not supported for StoreCinUnroll")
@@ -4071,9 +4114,6 @@ class Solution(collections.abc.Mapping):
       if not state["GuaranteeNoPartialA"] or not state["GuaranteeNoPartialB"]:
         state["_UseSgprForGRO"] = False
         #reject(state, "PBC with wide load has insufficient overlap guarantees- try GRVW=1 or adding appropriate Assert*ElementMultiple")
-
-
-           
 
     if state["EnableMatrixInstruction"]:
       cont1 = not state["GuaranteeNoPartialB"]
