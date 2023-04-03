@@ -537,6 +537,11 @@ validParameters = {
     # GSUSARR=True means the 4 workgroups round robin split up the chunks of the summation: k=0 -> DU-1, 4DU -> 5DU-1, ...; k=1DU -> 2DU-1, 5DU -> 6DU-1...; ...
     "GlobalSplitUSummationAssignmentRoundRobin":  [ False, True ],
 
+    # Enable atomic_add instruction for GlobalSplitU with SingleBuffer
+    # So far, f32 only.
+    # NOTE: This is not recommended
+    "GlobalSplitUAtomicAdd":      [ False, True ],
+
     # in opencl for some compilers, performance improved by putting a memfence after each sub-iteration; it prevented the loads of one sub-iteration from being moved
     # into a prior iteration, which would help latency but it consumed more vgprs which was a net loss
     "UnrollMemFence":             [ False, True ],
@@ -711,11 +716,11 @@ validParameters = {
     "Use64bShadowLimit":   [ True, False],
 
     # Attempt to vectorize atomics
-    # 1,2,4 : Number of elements to vectorize
+    # 1,2 : Number of elements to vectorize
     # -1 : Maximum supported value
-    # Wider VAW is effective only for C load of "load + atomic_cmpswap" case. Atomic operation itself is not vectorized
-    # TODO: support larger width for atomic_cmpswap
-    "VectorAtomicWidth":          [ -1, 1, 2, 4] ,
+    # This defines width of atomic_cmpswap (bpe(external) * VAW * 32bit = width of atomic_cmpswap (b32 or b64))
+    # AtomicAdd case, only 1 supported
+    "VectorAtomicWidth":          [ -1, 1, 2] ,
 
     # Assertion properties
     # These provide information or assertions that the problem size meets certain requirements
@@ -749,7 +754,7 @@ validParameters = {
     # Kernel generator will assume that the FreeIndex[0] size is some multiple of the element size
     # and uses this to optimize the kernel.
     # FreeIndex[0] is usually letter "I"
-    # (Recommended AF0EM value is 8 for half, 4 for single, 2 for double)
+    # (Recommended AF0EM value for the best performance is 16 for I8, 8 for half, 4 for single, 2 for double)
     #
     # Optimizations enabled by AssertFree0ElementMultiple>1:
     # Load optimizations:
@@ -764,7 +769,7 @@ validParameters = {
     #   (since C matrix is always coalesced in Free0 index direction and this assertion guarantees the index element multiple)
     #
     # 1 indicates no assertion (since all sizes are multiples of 1)
-    "AssertFree0ElementMultiple" : [1,2,4,8],
+    "AssertFree0ElementMultiple" : [1,2,4,8,16],
 
     # Kernel generator will assume that the FreeIndex[1] size is some multiple of the element size
     # and uses this to optimize the kernel.
@@ -775,7 +780,7 @@ validParameters = {
     #  - See above AssertFree0ElementMultiple "Load optimizations"
 
     # 1 indicates no assertion (since all sizes are multiples of 1)
-    "AssertFree1ElementMultiple" : [1,2,4,8],
+    "AssertFree1ElementMultiple" : [1,2,4,8,16],
 
     # Some kernels only work for certain sizes, see ProblemProperties in TensileTypes for exact defs
     "AssertMinApproxSize" : [0,1,2,3],
@@ -1375,6 +1380,7 @@ defaultBenchmarkCommonParameters = [
     {"GlobalSplitUAlgorithm":     [ "SingleBuffer" ] },
     {"GlobalSplitUSummationAssignmentRoundRobin": [ True ] },
     {"GlobalSplitUWorkGroupMappingRoundRobin":    [ False ] },
+    {"GlobalSplitUAtomicAdd":     [ False ] },
     {"MacroTileShapeMin":         [ 1 ] },
     {"MacroTileShapeMax":         [ 64 ] },
     {"PersistentKernel":          [ 0 ] },
@@ -1854,7 +1860,10 @@ def tryAssembler(isaVersion, asmString, debug=False, *options):
   if isaVersion[0] >= 10:
     options += ['-mwavefrontsize64']
 
-  args = [globalParameters["AssemblerPath"], '-x', 'assembler',
+  assembler = globalParameters['AssemblerPath']
+  if assembler is None:
+    raise ValueError('No assembler available; set TENSILE_ROCM_ASSEMBLER_PATH to point to ROCm Clang.')
+  args = [assembler, '-x', 'assembler',
           '-target', 'amdgcn-amdhsa',
           '-mcpu='+gfxName(isaVersion),
           *options,
