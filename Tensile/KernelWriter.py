@@ -132,7 +132,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       elif kernel["DirectToVgprB"]:
         # DTVB case, use A
         latencyForLRB = latencyForLRA
-      latencyForLR = max(latencyForLRA, latencyForLRB)
+      if not curr:
+        latencyForLR = latencyForLRB
+      else:
+        #latencyForLR = max(latencyForLRA, latencyForLRB)
+        latencyForLR = latencyForLRA if self.numIterPerCoalescedReadB > self.numIterPerCoalescedReadA else latencyForLRB
 
       latencyForLR -= max(latencyLeft,0) # remaining latency in mfma
       if not curr:
@@ -140,6 +144,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       while latencyForLR > 0:
         latencyForLR -= self.miLatency
         latencyForLRCount += 1
+
+      if kernel["1LDSBuffer"] and curr and latencyForLRCount == 0:
+         # 1LDS buffer case, we need at least 1 MFMA between end of local read and start of local write (fur current local read only)
+         # otherwise, it results in overflowedResources = 5 error
+        latencyForLRCount = 1
 
     return numMfmaForLR, latencyForLRCount, latencyLeft
 
@@ -284,7 +293,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
           # for 1LDSB or DTL, we have to issue localwrites after localreads
           numMfmaForLRCurr, latencyForLRCount, latencyLeft = self.countNumMfmaForCurrentOrNextLoopLR(kernel, tensorParametersA, tensorParametersB)
           if self.numVgprBuffer == kernel["LoopIters"]:
-            if (not kernel["DirectToVgprA"]) and self.numReadPerVectorA > 1 or (not kernel["DirectToVgprB"]) and self.numReadPerVectorB > 1:
+            if ((not kernel["DirectToVgprA"]) and self.numReadPerVectorA > 1 or (not kernel["DirectToVgprB"]) and self.numReadPerVectorB > 1) and \
+               (not kernel["VgprForLocalReadPacking"]):
+            # no VgprForLocalReadPacking only
             # fp16 or bf16, we read 1 element to vgprBuffer the other element to tempVgpr.
             # since each iteration shares same tempVgpr, only read-to-vgprBuffer can
             # be scheduled in the front of loop.
@@ -1673,6 +1684,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   def setupNewTile(self, kernel, tensorParametersA, tensorParametersB, isPap, isOptNLL=False, forceNoTileCode=False, forceNoGRCode=False):
     kl = []
+    kl_LW = [] # generate tile assignment code + local write code separately for init code optimization
 
     if self.enable["PreLoop"]:
       ####################################
@@ -1704,10 +1716,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.dontAppendCode = isPap and kernel["PrefetchAcrossPersistentMode"] == 1 and ((not needShift) or self.useGlobalReadTileVgpr)
       self.dontAppendCode = self.dontAppendCode or forceNoTileCode
       # tile assignments
-      kl.append(self.comment("global read addresses: tile offset assignment a"))
-      kl.append(self.graTileAssignment(kernel, tensorParametersA))
-      kl.append(self.comment("global read addresses: tile offset assignment b"))
-      kl.append(self.graTileAssignment(kernel, tensorParametersB))
+      kl_LW.append(self.comment("global read addresses: tile offset assignment a"))
+      kl_LW.append(self.graTileAssignment(kernel, tensorParametersA))
+      kl_LW.append(self.comment("global read addresses: tile offset assignment b"))
+      kl_LW.append(self.graTileAssignment(kernel, tensorParametersB))
+      # init code optimization
+      # not init code opt case, add tile assignments code here
+      # init code opt case, not insert tile assignments code here and return tile assignments code separately for replacement
+      if not self.isInitCodeOptLW:
+        kl += kl_LW
+        kl_LW = []
 
       self.dontAppendCode = isPap and (not needShift)
       self.dontAppendCode = self.dontAppendCode or forceNoTileCode
@@ -1798,39 +1816,51 @@ class KernelWriter(metaclass=abc.ABCMeta):
       ####################################
       # Local Write Addresses
       ####################################
-      kl.append(self.comment3("Local Write Addresses"))
+      kl_LW.append(self.comment3("Local Write Addresses"))
 
       # tile assignments
-      kl.append(self.lwaTileAssignment(kernel, tensorParametersA))
-      kl.append(self.lwaTileAssignment(kernel, tensorParametersB))
+      kl_LW.append(self.lwaTileAssignment(kernel, tensorParametersA))
+      kl_LW.append(self.lwaTileAssignment(kernel, tensorParametersB))
 
       # unroll assignments
-      kl.append(self.lwaUnrollAssignment(kernel, tensorParametersA))
-      kl.append(self.lwaUnrollAssignment(kernel, tensorParametersB))
+      kl_LW.append(self.lwaUnrollAssignment(kernel, tensorParametersA))
+      kl_LW.append(self.lwaUnrollAssignment(kernel, tensorParametersB))
 
       # if PAP, no need to reset LWA, but if not OptNLL, we still do this (due to TailLoop)
 
       self.dontAppendCode = isPap and kernel["PrefetchAcrossPersistentMode"] == 1
       self.dontAppendCode = self.dontAppendCode or forceNoTileCode
       # first offsets
-      kl.append(self.comment("local write addresses: first offset a"))
-      kl.append(self.lwaFirstOffset(kernel, tensorParametersA))
-      kl.append(self.comment("local write addresses: first offset b"))
-      kl.append(self.lwaFirstOffset(kernel, tensorParametersB))
+      kl_LW.append(self.comment("local write addresses: first offset a"))
+      kl_LW.append(self.lwaFirstOffset(kernel, tensorParametersA))
+      kl_LW.append(self.comment("local write addresses: first offset b"))
+      kl_LW.append(self.lwaFirstOffset(kernel, tensorParametersB))
       self.dontAppendCode = False
       self.dontAppendCode = self.dontAppendCode or forceNoTileCode
 
       # final offsets
-      kl.append(self.lwaFinalOffsets(kernel, tensorParametersA))
-      kl.append(self.lwaFinalOffsets(kernel, tensorParametersB))
+      kl_LW.append(self.lwaFinalOffsets(kernel, tensorParametersA))
+      kl_LW.append(self.lwaFinalOffsets(kernel, tensorParametersB))
 
       # declare addresses
-      kl.append(self.lwaDeclareAddresses(kernel, tensorParametersA))
-      kl.append(self.lwaDeclareAddresses(kernel, tensorParametersB))
+      kl_LW.append(self.lwaDeclareAddresses(kernel, tensorParametersA))
+      kl_LW.append(self.lwaDeclareAddresses(kernel, tensorParametersB))
 
       # init pointers
-      kl.append(self.localWriteInitPointers(kernel, tensorParametersA))
-      kl.append(self.localWriteInitPointers(kernel, tensorParametersB))
+      kl_LW.append(self.localWriteInitPointers(kernel, tensorParametersA))
+      kl_LW.append(self.localWriteInitPointers(kernel, tensorParametersB))
+
+      # init code optimization
+      if self.isInitCodeOptLW:
+        # init code optimization case, release lwaVgpr here after all lwa code is generated
+        # (to avoid lwa vgpr overwritten by remaining lwa code)
+        self.lwaReleaseTileVgpr(kernel, tensorParametersA)
+        self.lwaReleaseTileVgpr(kernel, tensorParametersB)
+      else:
+        # not init code opt case, add local write code here
+        # init code opt case, not insert local write code here and return local write code separately for replacement
+        kl += kl_LW
+        kl_LW = []
 
     ###########################################################################
     # summations loops: open
@@ -1933,7 +1963,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     kl.append(self.comment3("End setupNewTile, isPap=%s") % isPap)
 
-    return kl
+    return kl, kl_LW
 
 
   ##############################################################################
@@ -2261,7 +2291,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if kernel["PrefetchGlobalRead"] == 2 and NLLlast:
         forceNoGRCode = True
 
-      newTileCodes = self.setupNewTile(kernel, self.tPA, self.tPB, isPap=True, isOptNLL=True, forceNoTileCode=forceNoTileCode, forceNoGRCode = forceNoGRCode)
+      newTileCodes, _ = self.setupNewTile(kernel, self.tPA, self.tPB, isPap=True, isOptNLL=True, \
+                                       forceNoTileCode=forceNoTileCode, forceNoGRCode = forceNoGRCode)
       codes = '\n'.join([str(x) for x in newTileCodes])
       kStr += codes
       # openPrefetchAcrossPersistent should be after newTileCodes to set correct values to ShadowLimit
@@ -2933,30 +2964,56 @@ class KernelWriter(metaclass=abc.ABCMeta):
     kl.append(self.functionSignatureSuffix(kernel))
     kl.append(self.functionBegin(kernel))
 
-    kl.append(self.comment3("Allocate Resources"))
-    kl.append(self.allocateResources(kernel))
+    # init code optimization: generate local read address code before wait for kernel arg load (in allocateResources())
+    klLR = []
 
     if self.enable["PreLoop"]:
       ####################################
       # Local Read Addresses
       ####################################
-      kl.append(self.comment3("Local Read Addresses"))
+      klLR.append(self.comment3("Local Read Addresses"))
 
       # tile assignments
-      kl.append(self.comment("local read addresses: tile assignments a/b"))
-      kl.append(self.lraTileAssignment(kernel, tensorParametersA, tensorParametersB))
+      klLR.append(self.comment("local read addresses: tile assignments a/b"))
+      klLR.append(self.lraTileAssignment(kernel, tensorParametersA, tensorParametersB))
 
       # final offsets
-      kl.append(self.comment("local read addresses: final offsets a"))
-      kl.append(self.lraFinalOffset(kernel, tensorParametersA))
-      kl.append(self.comment("local read addresses: final offsets b"))
-      kl.append(self.lraFinalOffset(kernel, tensorParametersB))
+      klLR.append(self.comment("local read addresses: final offsets a"))
+      klLR.append(self.lraFinalOffset(kernel, tensorParametersA))
+      klLR.append(self.comment("local read addresses: final offsets b"))
+      klLR.append(self.lraFinalOffset(kernel, tensorParametersB))
 
       # declare addresses
-      kl.append(self.comment("local read addresses: declare addresses a"))
-      kl.append(self.lraDeclareAddresses(kernel, tensorParametersA))
-      kl.append(self.comment("local read addresses: declare addresses b"))
-      kl.append(self.lraDeclareAddresses(kernel, tensorParametersB))
+      klLR.append(self.comment("local read addresses: declare addresses a"))
+      klLR.append(self.lraDeclareAddresses(kernel, tensorParametersA))
+      klLR.append(self.comment("local read addresses: declare addresses b"))
+      klLR.append(self.lraDeclareAddresses(kernel, tensorParametersB))
+
+    # init code optimization : allocate resource
+    self.lwaInitOptAllocate()
+
+    lraCode=None
+    placeholderInitCodeOpt=None
+    if self.isInitCodeOptLR:
+      if self.isInitCodeOptLW:
+        placeholderInitCodeOpt = "__placeholderInitCodeOpt__" # placeholder for local write code (for future replacement)
+
+      # string for local read code
+      lraCode = '\n'.join([str(x) for x in klLR])
+      # local write code is generated later. Here, just add placeholder to replace with local write code
+      if self.isInitCodeOptLW:
+        lraCode += '\n' + placeholderInitCodeOpt + '\n' 
+      klLR = [] # clean up after use
+
+    kl.append(self.comment3("Allocate Resources"))
+    kl.append(self.allocateResources(kernel, lraCode))
+    lraCode = None # clean up after use
+
+    if not self.isInitCodeOptLR:
+      # not init code optimization case
+      # add local read address code to kl after allocateResources()
+      kl += klLR
+      klLR = [] # clean up after use
 
     # doShadowInit performs initialization in the 'shadow' of the global mem prefetch
     self.doShadowInit = 0
@@ -2979,12 +3036,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # first prefetch is outside persistent loop, subsequent prefetch will
       # be integrated into no-load-loop
-      kl += self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isPap=False, isOptNLL=False)
+      kl_NT, kl_LW = self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isPap=False, isOptNLL=False)
+      kl += kl_NT
       kl.append(self.openPersistentLoop(kernel))
     else:
       # prefetch is inside persistent loop
       kl.append(self.openPersistentLoop(kernel))
-      kl += self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isPap=False, isOptNLL=False)
+      kl_NT, kl_LW = self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isPap=False, isOptNLL=False)
+      kl += kl_NT
+
+    # init code optimization : release resource
+    self.lwaInitOptRelease()
 
     pack = [ Code.Module() for i in range (self.numVgprBuffer+1) ]
     self.preLoopLocalWriteCode = None
@@ -3404,7 +3466,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     if self.prefetchAcrossPersistent and kernel["PrefetchAcrossPersistentMode"] != 1:
       kl.append(str(self.openPrefetchAcrossPersistent(kernel, isOptNLL=False)))
-      kl += self.setupNewTile(kernel, self.tPA, self.tPB, isPap=True, isOptNLL=False)
+      kl_NT, _ = self.setupNewTile(kernel, self.tPA, self.tPB, isPap=True, isOptNLL=False)
+      kl += kl_NT
       kl.append(str(self.closePrefetchAcrossPersistent(kernel, isOptNLL=False)))
 
     kl.append(self.endSummation(kernel))
@@ -3489,6 +3552,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     kl.append(self.closeString(kernel))
     kStr = '\n'.join([str(x) for x in kl])
+    # init code opt
+    if placeholderInitCodeOpt != None:
+      # replace placeholder with localWriteCode
+      kStrLW = '\n'.join([str(x) for x in kl_LW])
+      kStr = kStr.replace(placeholderInitCodeOpt, kStrLW)
     afterFunctionSignature = kStr
 
     error = self.overflowedResources
@@ -3769,7 +3837,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     vwb = kernel["GlobalLoadVectorWidthB"]
 
     # allow LocalReadVectorWidthB for TLUB + MatrixInstruction
-    self.allowLRVWBforTLUandMI = kernel["allowLRVWBforTLUandMI"]
+    self.VectorWidthB = kernel["VectorWidthB"]
 
     self.numItersPLR = kernel["PrefetchLocalRead"]%kernel["LoopIters"]
     self.numVgprBuffer = kernel["LoopIters"] if kernel["PrefetchLocalRead"] > kernel["LoopIters"] else kernel["PrefetchLocalRead"]
@@ -3778,34 +3846,30 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # MergeRead 0: ds_readAx1 ds_readBx1 mfma | ds_readAx1 ds_readBx1 mfma | => ds_readAx2 ds_readBx1 mfma | ds_readBx1 mfma |
     # MergeRead 1: ds_readAx1 ds_readBx1 mfma | ds_readAx1 ds_readAx1 mfma | => ds_readAx2 ds_readBx1 ds_readBx1 mfma | mfma |
     MergeRead = 0
-    if kernel["UnrollMajorLDSA"] or MergeRead or self.allowLRVWBforTLUandMI:
-      if kernel["DirectToVgprA"]:
-        # DirectToVgprA case, ignore LocalReadVectorWidth and use GlobalLoadVectorWidth instead.
-        self.lrvwA = vwa
-      else:
-        self.lrvwA = kernel["LocalReadVectorWidth"]
+    if kernel["UnrollMajorLDSA"] or MergeRead:
+      self.lrvwA = kernel["LocalReadVectorWidth"]
     else:
       if kernel["EnableMatrixInstruction"]:
         self.lrvwA = kernel["MIInputPerThread"]
       else:
         self.lrvwA = 1
-    if kernel["UnrollMajorLDSB"] or MergeRead or self.allowLRVWBforTLUandMI:
-      if kernel["DirectToVgprB"]:
-        # DirectToVgprB case, ignore LocalReadVectorWidth and use GlobalLoadVectorWidth instead.
-        self.lrvwB = vwb
-      else:
-        self.lrvwB = kernel["LocalReadVectorWidth"]
+    if kernel["DirectToVgprA"]:
+      # DirectToVgprA case, ignore LocalReadVectorWidth and use GlobalLoadVectorWidth instead.
+      self.lrvwA = vwa
+    if kernel["UnrollMajorLDSB"] or MergeRead:
+      self.lrvwB = kernel["LocalReadVectorWidth"]
     else:
       if kernel["EnableMatrixInstruction"]:
         self.lrvwB = kernel["MIInputPerThread"]
       else:
         self.lrvwB = 1
+    if kernel["DirectToVgprB"]:
+      # DirectToVgprB case, ignore LocalReadVectorWidth and use GlobalLoadVectorWidth instead.
+      self.lrvwB = vwb
+    elif self.VectorWidthB > 1:
+      # self.VectorWidthB > 1 case, use self.VectorWidthB as lrvwB
+      self.lrvwB = self.VectorWidthB
 
-    # DirectToVgprB + TLU case, set lrvwB = VW
-    # DirectToVgprB case, global load data directly goes to Vgpr.
-    # If VW=2, it means lrwvB is 2.
-    if kernel["DirectToVgprB"] and kernel["ProblemType"]["TLUB"]:
-      self.lrvwB = kernel["VectorWidth"]
     # DirectToVgpr + TLU=False case
     # set lrvw = VW
     self.vgprValuDouble = False
@@ -3822,9 +3886,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["EnableMatrixInstruction"]:
       self.numReadsIterCoalescedA = self.lrvwA // kernel["MIInputPerThread"]
       self.numReadsIterCoalescedB = self.lrvwB // kernel["MIInputPerThread"]
-      if self.allowLRVWBforTLUandMI:
-        if kernel["ProblemType"]["TLUA"]:
-          self.numReadsIterCoalescedA = 1
+      if kernel["DirectToVgprA"] and kernel["ProblemType"]["TLUA"]:
+        self.numReadsIterCoalescedA = 1
+      if self.VectorWidthB > 1:
         self.numReadsIterCoalescedB = 1
     else:
       self.numReadsIterCoalescedA  = 1
@@ -4134,6 +4198,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
         # not Complex and DTVA + PGR2 case, use B for inner loop to schedule more mfma between DTVA global read instructions
         self.swapMfmaInnerLoop = True
 
+    # init code optimization
+    # generate local read/write address code and global read tile offset code before wait for kernel arg load (if applicable)
+    # set False here for source kernel (enable only for Asm)
+    self.isInitCodeOptLR = False
+    self.isInitCodeOptLW = False
+
   @staticmethod
   def zpForSumIdx(sumIdx, zeroPad):
      """ Returns zero-pad for specified sumIdx if it matches or None if not """
@@ -4193,7 +4263,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   # Allocate Resources
   ##############################################################################
   @abc.abstractmethod
-  def allocateResources(self, kernel):
+  def allocateResources(self, kernel, lraCode=None):
     return ""
 
 
@@ -4387,7 +4457,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   # Global Read Addresses: Final Offsets A/B
   ##############################################################################
   @abc.abstractmethod
-  def graFinalOffsets(self, kernel, tP):
+  def graFinalOffsets(self, kernel, tP, releaseResource=False):
     return ""
 
   ##############################################################################
@@ -4420,10 +4490,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return ""
 
   ##############################################################################
+  # Local Write Addresses: Release tile related vgpr
+  ##############################################################################
+  @abc.abstractmethod
+  def lwaReleaseTileVgpr(self, kernel, tP):
+    return ""
+
+  ##############################################################################
   # Local Write Addresses: First Offset A/B
   ##############################################################################
   @abc.abstractmethod
-  def lwaFirstOffset(self, kernel, tP, uDu):
+  def lwaFirstOffset(self, kernel, tP, uDu=0):
     return ""
 
   ##############################################################################
@@ -4438,6 +4515,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   @abc.abstractmethod
   def lwaDeclareAddresses(self, kernel, tP):
+    return ""
+
+  ##############################################################################
+  # Local Write Addresses: Allocate tmpSgpr for initOpt
+  ##############################################################################
+  @abc.abstractmethod
+  def lwaInitOptAllocate(self):
+    return ""
+
+  ##############################################################################
+  # Local Write Addresses: Release tmpSgpr for initOpt
+  ##############################################################################
+  @abc.abstractmethod
+  def lwaInitOptRelease(self):
     return ""
 
   ##############################################################################
